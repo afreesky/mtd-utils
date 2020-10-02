@@ -117,6 +117,11 @@ static int out_ubi;
 static int squash_owner;
 static int do_create_inum_attr;
 
+struct ubifs_info info_src;
+static struct ubifs_info *sinfo = &info_src;
+static int ubifs_sfd;
+static char *input;
+
 /* The 'head' (position) which nodes are written */
 static int head_lnum;
 static int head_offs;
@@ -138,7 +143,7 @@ static struct inum_mapping **hash_table;
 /* Inode creation sequence number */
 static unsigned long long creat_sqnum;
 
-static const char *optstring = "d:r:m:o:D:yh?vVe:c:g:f:Fp:k:x:X:j:R:l:j:UQqa";
+static const char *optstring = "d:r:m:o:D:yh?vVe:c:g:f:Fp:k:x:X:j:R:l:j:UQqas:";
 
 static const struct option longopts[] = {
 	{"root",               1, NULL, 'r'},
@@ -163,6 +168,7 @@ static const struct option longopts[] = {
 	{"orph-lebs",          1, NULL, 'p'},
 	{"squash-uids" ,       0, NULL, 'U'},
 	{"set-inode-attr",     0, NULL, 'a'},
+	{"src-ubifs-image",    1, NULL, 's'},
 	{NULL, 0, NULL, 0}
 };
 
@@ -636,7 +642,9 @@ static int get_options(int argc, char**argv)
 		case 'a':
 			do_create_inum_attr = 1;
 			break;
-
+		case 's':
+			input = xstrdup(optarg);
+			break;
 		}
 	}
 
@@ -1850,6 +1858,176 @@ static int write_data(void)
 	return flush_nodes();
 }
 
+static int read_src_supper(int fd)
+{
+	struct ubifs_sb_node sup;
+	int err;
+	
+	err = lseek(fd, 0, SEEK_SET);
+	if (err == -1){
+		perror("lseek");
+		return -1;
+	}
+
+	err = read(fd, &sup, sizeof(sup));
+	if (err == -1){
+		perror("read");
+		return -1;
+	}
+
+	sinfo->key_hash_type = sup.key_hash;
+	sinfo->min_io_size   = le32_to_cpu(sup.min_io_size);
+	sinfo->leb_size      = le32_to_cpu(sup.leb_size);
+	sinfo->leb_cnt       = le32_to_cpu(sup.leb_cnt);
+	sinfo->max_leb_cnt   = le32_to_cpu(sup.max_leb_cnt);
+	sinfo->max_bud_bytes = le32_to_cpu(sup.max_bud_bytes);
+	sinfo->log_lebs      = le32_to_cpu(sup.log_lebs);
+	sinfo->lpt_lebs      = le32_to_cpu(sup.lpt_lebs);
+	sinfo->orph_lebs     = le32_to_cpu(sup.orph_lebs);
+	sinfo->jhead_cnt     = le32_to_cpu(sup.jhead_cnt);
+	sinfo->fanout        = le32_to_cpu(sup.fanout);
+	sinfo->lsave_cnt     = le32_to_cpu(sup.lsave_cnt);
+	sinfo->default_compr = le32_to_cpu(sup.default_compr);
+	sinfo->rp_size       = le32_to_cpu(sup.rp_size);
+
+	if (le32_to_cpu(sup.flags) & UBIFS_FLG_BIGLPT)
+		sinfo->big_lpt = 1;
+	if  (le32_to_cpu(sup.flags) & UBIFS_FLG_SPACE_FIXUP)
+		sinfo->space_fixup = 1;
+
+	printf("source min io size:%d, leb size:%d\n", sinfo->min_io_size, sinfo->leb_size);
+
+	return 0;
+}
+
+static int read_src_master(int fd)
+{
+	struct ubifs_mst_node mst;
+	int err;
+
+	err = lseek(fd, sinfo->leb_size, SEEK_SET); /*lum 1*/
+	if (err == -1){
+		perror("lseek");
+		return -1;
+	}
+	
+	err = read(fd, &mst, sizeof(mst));
+	if (err == -1){
+		perror("read");
+		return -1;
+	}
+
+	sinfo->highest_inum    = le64_to_cpu(mst.highest_inum);
+	sinfo->zroot.lnum      = le32_to_cpu(mst.root_lnum);
+	sinfo->zroot.offs      = le32_to_cpu(mst.root_offs);
+	sinfo->zroot.len       = le32_to_cpu(mst.root_len);
+	sinfo->gc_lnum         = le32_to_cpu(mst.gc_lnum);
+	sinfo->ihead_lnum      = le32_to_cpu(mst.ihead_lnum);
+	sinfo->ihead_offs      = le32_to_cpu(mst.ihead_offs);
+	sinfo->old_idx_sz      = le64_to_cpu(mst.index_size);
+	sinfo->lpt_lnum        = le32_to_cpu(mst.lpt_lnum);
+	sinfo->lpt_offs        = le32_to_cpu(mst.lpt_offs);
+	sinfo->nhead_lnum      = le32_to_cpu(mst.nhead_lnum);
+	sinfo->nhead_offs      = le32_to_cpu(mst.nhead_offs);
+	sinfo->ltab_lnum       = le32_to_cpu(mst.ltab_lnum);
+	sinfo->ltab_offs       = le32_to_cpu(mst.ltab_offs);
+	sinfo->lsave_lnum      = le32_to_cpu(mst.lsave_lnum);
+	sinfo->lsave_offs      = le32_to_cpu(mst.lsave_offs);
+	sinfo->lscan_lnum      = le32_to_cpu(mst.lscan_lnum);
+	sinfo->lst.empty_lebs  = le32_to_cpu(mst.empty_lebs);
+	sinfo->lst.idx_lebs    = le32_to_cpu(mst.idx_lebs);
+	sinfo->lst.total_free  = le64_to_cpu(mst.total_free);
+	sinfo->lst.total_dirty = le64_to_cpu(mst.total_dirty);
+	sinfo->lst.total_used  = le64_to_cpu(mst.total_used);
+	sinfo->lst.total_dead  = le64_to_cpu(mst.total_dead);
+	sinfo->lst.total_dark  = le64_to_cpu(mst.total_dark);
+	sinfo->leb_cnt         = le32_to_cpu(mst.leb_cnt);
+
+	return 0;
+}
+
+int read_src_data(int fd, int lnum, int offs, void* buff, int len)
+{
+	int file_offset = sinfo->leb_size * lnum + offs;
+	int err;
+	
+	err = lseek(fd, file_offset, SEEK_SET);
+	if (err == -1){
+		perror("lseek");
+		return -1;
+	}
+	
+	err = read(fd, buff, len);
+	if (err == -1){
+		perror("read");
+		return -1;
+	}
+
+	return 0;
+}
+
+int add_data_node(struct ubifs_idx_node* idx)
+{
+	int i;
+	int child_cnt = le16_to_cpu(idx->child_cnt);
+	short level = le16_to_cpu(idx->level);
+	struct ubifs_branch *br;
+	int lnum,offs,len;
+
+	for (i = 0; i < child_cnt; i++) {
+		br = ubifs_idx_branch(sinfo, idx, i);
+		lnum = le32_to_cpu(br->lnum);
+		offs = le32_to_cpu(br->offs);
+		len = le32_to_cpu(br->len);
+		if (idx->level == 0) {
+			struct ubifs_ch *ch = (struct ubifs_ch*)node_buf;			
+			read_src_data(ubifs_sfd, lnum,offs,node_buf, len);
+			len = le32_to_cpu(ch->len);
+			add_node(br->key, NULL, node_buf, len);
+		}else {
+			int idx_sz;
+			struct ubifs_idx_node *cidx;
+			idx_sz = ubifs_idx_node_sz(sinfo, sinfo->fanout);
+			cidx = xmalloc(idx_sz);
+			read_src_data(ubifs_sfd, lnum, offs, cidx, idx_sz);
+			add_data_node(cidx);
+			free(cidx);
+		}
+	}
+}
+ 
+static int _write_data(void)
+{
+	size_t idx_sz;
+	struct ubifs_idx_node *idx;
+	struct ubifs_sb_node sup;
+
+	//read supper block, 
+	ubifs_sfd = open(input, O_RDONLY);
+	if (ubifs_sfd < 0) {
+		printf("open ubifs image file %s failed\n", input);
+		return -1;
+	}
+
+	sinfo->key_len = UBIFS_SK_LEN;
+#ifdef WITHOUT_LZO
+	sinfo->default_compr = UBIFS_COMPR_ZLIB;
+#else
+	sinfo->default_compr = UBIFS_COMPR_LZO;
+#endif
+
+	read_src_supper(ubifs_sfd);
+	read_src_master(ubifs_sfd);
+
+	idx_sz = ubifs_idx_node_sz(sinfo, sinfo->fanout);
+	idx = xmalloc(idx_sz);
+	read_src_data(ubifs_sfd, sinfo->zroot.lnum, sinfo->zroot.offs, idx, idx_sz);
+	add_data_node(idx);
+	free(idx);
+
+	return flush_nodes();
+}
+
 static int namecmp(const char *name1, const char *name2)
 {
 	size_t len1 = strlen(name1), len2 = strlen(name2);
@@ -2450,7 +2628,11 @@ static int mkfs(void)
 	if (err)
 		goto out;
 
-	err = write_data();
+	if (!input) {
+		err = write_data();
+	}else {
+		err = _write_data();
+	}
 	if (err)
 		goto out;
 
