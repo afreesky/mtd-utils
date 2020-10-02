@@ -2025,6 +2025,7 @@ static int _write_data(void)
 	add_data_node(idx);
 	free(idx);
 
+
 	return flush_nodes();
 }
 
