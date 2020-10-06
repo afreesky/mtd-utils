@@ -1,6 +1,6 @@
-CC := $(CROSS)gcc
-AR := $(CROSS)ar
-RANLIB := $(CROSS)ranlib
+CC := $(CROSS_COMPILE)gcc
+AR := $(CROSS_COMPILE)ar
+RANLIB := $(CROSS_COMPILE)ranlib
 
 # Stolen from Linux build system
 comma = ,

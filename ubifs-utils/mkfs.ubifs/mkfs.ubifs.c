@@ -40,6 +40,9 @@
 /* Default time granularity in nanoseconds */
 #define DEFAULT_TIME_GRAN 1000000000
 
+#define SIZE_1M  0x100000
+#define DATA_CACHE_4M 0x1000000
+
 /**
  * struct idx_entry - index entry.
  * @next: next index entry (NULL at end of list)
@@ -95,6 +98,14 @@ struct inum_mapping {
 	struct stat st;
 };
 
+struct gzfile_cache {
+	char *buff;
+	int   bfsize;
+	int   bfoffs;
+	int   foffs;
+	int   fsize;
+};
+
 /*
  * Because we copy functions from the kernel, we use a subset of the UBIFS
  * file-system description object struct ubifs_info.
@@ -120,7 +131,15 @@ static int do_create_inum_attr;
 struct ubifs_info info_src;
 static struct ubifs_info *sinfo = &info_src;
 static int ubifs_sfd;
+static int ubifs_sgzfd;
+static int gzubifs = 0;
 static char *input;
+struct gzfile_cache dcache;
+struct gzfile_cache idxcache;
+struct idx_entry *sidx_list_first;
+static struct idx_entry *sidx_list_last;
+static size_t sidx_cnt;
+
 
 /* The 'head' (position) which nodes are written */
 static int head_lnum;
@@ -143,7 +162,7 @@ static struct inum_mapping **hash_table;
 /* Inode creation sequence number */
 static unsigned long long creat_sqnum;
 
-static const char *optstring = "d:r:m:o:D:yh?vVe:c:g:f:Fp:k:x:X:j:R:l:j:UQqas:";
+static const char *optstring = "d:r:m:o:D:yh?vVe:c:g:f:Fp:k:x:X:j:R:l:j:UQqas:z";
 
 static const struct option longopts[] = {
 	{"root",               1, NULL, 'r'},
@@ -169,6 +188,7 @@ static const struct option longopts[] = {
 	{"squash-uids" ,       0, NULL, 'U'},
 	{"set-inode-attr",     0, NULL, 'a'},
 	{"src-ubifs-image",    1, NULL, 's'},
+	{"gzip-src-image",     1, NULL, 'z'},
 	{NULL, 0, NULL, 0}
 };
 
@@ -644,6 +664,9 @@ static int get_options(int argc, char**argv)
 			break;
 		case 's':
 			input = xstrdup(optarg);
+			break;
+		case 'z':
+			gzubifs = 1;
 			break;
 		}
 	}
@@ -1858,20 +1881,155 @@ static int write_data(void)
 	return flush_nodes();
 }
 
-static int read_src_supper(int fd)
+static int open_source(void)
 {
-	struct ubifs_sb_node sup;
+	if (input == NULL)
+		return 0;
+	
+	if (gzubifs == 0) {
+		ubifs_sfd = open(input, O_RDONLY);
+		if (ubifs_sfd < 0) {
+			printf("open ubifs image file %s failed\n", input);
+			return -1;
+		}
+	}else {
+		ubifs_sgzfd = gzopen(input,"rb");
+		if (ubifs_sgzfd < 0) {
+			printf("open ubifs image file %s failed\n", input);
+			return -1;
+		}
+		dcache.bfoffs = 0;
+		dcache.foffs = 0;
+		dcache.fsize = 0;
+		dcache.bfsize = DATA_CACHE_4M;
+		dcache.buff = xmalloc(dcache.bfsize);
+		if (dcache.buff == 0) {
+			printf("alloc gz file cache memory failed\n");
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+int read_norm_file(int offs, void* buff, int len)
+{
 	int err;
 	
-	err = lseek(fd, 0, SEEK_SET);
+	err = lseek(ubifs_sfd, offs, SEEK_SET);
 	if (err == -1){
 		perror("lseek");
 		return -1;
 	}
-
-	err = read(fd, &sup, sizeof(sup));
+	
+	err = read(ubifs_sfd, buff, len);
 	if (err == -1){
 		perror("read");
+		return -1;
+	}
+
+	return err;
+}
+
+int read_gz_file(int offs, void* buff, int len)
+{
+	int err;
+	int readoff;
+	int readlen;
+	int freelen;
+	int buff_offset = 0;
+	char *gzcache_ptr;
+
+	do {
+		if ((offs >= dcache.foffs && 
+		    offs < (dcache.foffs + dcache.fsize) &&
+		    (offs + len) < (dcache.foffs + dcache.fsize))) {
+		    buff_offset = ((dcache.bfoffs + (offs - dcache.foffs)) & (DATA_CACHE_4M - 1));
+			if (buff_offset + len <=  dcache.bfsize) {
+				memcpy(buff, (dcache.buff + buff_offset), len);
+			}else {
+				int tail_len = (dcache.bfsize - buff_offset);
+				memcpy(buff, (dcache.buff + buff_offset), tail_len);
+				memcpy(buff + tail_len, dcache.buff, len - tail_len);
+			}
+
+			
+			//printf(">>> dcache offs:0x%0x, len:0x%x, read offs:0x%x, len:0x%x, ~ buff:0x%x\n",
+			//	dcache.foffs, dcache.fsize, offs, len, dcache.bfoffs);
+			
+			break;
+		}
+
+		//when read offset is in the front of buffer, reset buffer
+		if (offs < dcache.foffs) {
+			static int seekcnt =0;
+			dcache.bfoffs = 0;
+			dcache.foffs = 0;
+			dcache.fsize = 0;
+			err = gzseek(ubifs_sgzfd, (offs & 0xfff00000), SEEK_SET);
+			if (err == -1){
+				perror("gzseek");
+				return -1;
+			}
+			dcache.foffs = (offs & 0xfff00000);
+			printf("gzseek ...........%d\n", seekcnt++);
+		}
+
+		readoff = ((dcache.bfoffs + dcache.fsize) & (DATA_CACHE_4M - 1));
+		freelen = DATA_CACHE_4M - dcache.fsize;
+		if (freelen < SIZE_1M) {
+			dcache.bfoffs = (dcache.bfoffs + (SIZE_1M - freelen)) & (DATA_CACHE_4M - 1);
+			dcache.foffs += (SIZE_1M - freelen);
+			dcache.fsize -= (SIZE_1M - freelen);
+		}
+		
+		gzcache_ptr = dcache.buff + readoff;
+		readlen = (DATA_CACHE_4M - readoff  >= SIZE_1M) ? SIZE_1M : (DATA_CACHE_4M - readoff);
+		err = gzread(ubifs_sgzfd, gzcache_ptr, readlen);
+		if (err > 0) {
+			dcache.fsize += err;
+			//printf("gzread file return,hope readlen:0x%x, ret:0x%x, readoff:0x%x\n", readlen, err, readoff);
+		}else{
+			printf("##########read len:%d\n", readlen);
+			perror("###########gzread ");
+
+			dcache.bfoffs = 0;
+			dcache.foffs = 0;
+			dcache.fsize = 0;
+			err = gzseek(ubifs_sgzfd, 0, SEEK_SET);
+			if (err == -1){
+				perror("gzseek");
+				return -1;
+			}			
+			return -1;
+		}
+	}while(1);
+
+	//check if read the first idx node. prefetch and cache it
+	//printf("!!! return len: 0x%x, %d\n", len, len);
+
+	return len;
+}
+
+int read_file(int offs, void* buff, int len)
+{
+	if (gzubifs) {
+		return read_gz_file(offs, buff, len);
+	}else{
+		return read_norm_file(offs, buff, len);
+	}
+
+	return 0;
+}
+
+static int read_src_supper(void)
+{
+	struct ubifs_sb_node sup;
+	int err;
+	
+	err = read_file(0, &sup, sizeof(sup));
+	if (err == -1){
+		perror("read supper");
 		return -1;
 	}
 
@@ -1895,25 +2053,18 @@ static int read_src_supper(int fd)
 	if  (le32_to_cpu(sup.flags) & UBIFS_FLG_SPACE_FIXUP)
 		sinfo->space_fixup = 1;
 
-	printf("source min io size:%d, leb size:%d\n", sinfo->min_io_size, sinfo->leb_size);
-
 	return 0;
 }
 
-static int read_src_master(int fd)
+static int read_src_master(void)
 {
 	struct ubifs_mst_node mst;
+	int offset = sinfo->leb_size;
 	int err;
-
-	err = lseek(fd, sinfo->leb_size, SEEK_SET); /*lum 1*/
-	if (err == -1){
-		perror("lseek");
-		return -1;
-	}
 	
-	err = read(fd, &mst, sizeof(mst));
+	err = read_file(offset, &mst, sizeof(mst));
 	if (err == -1){
-		perror("read");
+		perror("read master");
 		return -1;
 	}
 
@@ -1946,21 +2097,69 @@ static int read_src_master(int fd)
 	return 0;
 }
 
-int read_src_data(int fd, int lnum, int offs, void* buff, int len)
+int read_src_data(int lnum, int offs, void* buff, int len)
 {
 	int file_offset = sinfo->leb_size * lnum + offs;
 	int err;
-	
-	err = lseek(fd, file_offset, SEEK_SET);
+
+	err = read_file(file_offset, buff, len);
 	if (err == -1){
-		perror("lseek");
+		perror("read data");
 		return -1;
 	}
-	
-	err = read(fd, buff, len);
-	if (err == -1){
-		perror("read");
-		return -1;
+
+	return 0;
+}
+
+static int add_to_sindex(union ubifs_key *key, char *name, int lnum, int offs,
+			int len)
+{
+	struct idx_entry *e;
+
+	//printf("LEB %d offs %d len %d\n", lnum, offs, len);
+	e = xmalloc(sizeof(struct idx_entry));
+	e->next = NULL;
+	e->prev = sidx_list_last;
+	e->key = *key;
+	e->name = name;
+	e->lnum = lnum;
+	e->offs = offs;
+	e->len = len;
+	if (!sidx_list_first)
+		sidx_list_first = e;
+	if (sidx_list_last)
+		sidx_list_last->next = e;
+	sidx_list_last = e;
+	sidx_cnt += 1;
+	return 0;
+}
+
+int add_sindex(struct ubifs_idx_node* idx)
+{
+	int i;
+	int child_cnt = le16_to_cpu(idx->child_cnt);
+	short level = le16_to_cpu(idx->level);
+	struct ubifs_branch *br;
+	int lnum,offs,len;
+
+	//printf("---add_sindex--- level %d child_cnt %d\n", level, child_cnt);
+
+	for (i = 0; i < child_cnt; i++) {
+		br = ubifs_idx_branch(sinfo, idx, i);
+		lnum = le32_to_cpu(br->lnum);
+		offs = le32_to_cpu(br->offs);
+		len = le32_to_cpu(br->len);
+		if (level == 0) {
+			add_to_sindex(&br->key, 0, lnum, offs, len);
+		}else {
+			int idx_sz;
+			struct ubifs_idx_node *cidx;
+			idx_sz = ubifs_idx_node_sz(sinfo, sinfo->fanout);
+			cidx = xmalloc(idx_sz);
+			read_src_data(lnum, offs, cidx, idx_sz);
+			add_sindex(cidx);
+			free(cidx);
+		}
 	}
 
 	return 0;
@@ -1979,9 +2178,9 @@ int add_data_node(struct ubifs_idx_node* idx)
 		lnum = le32_to_cpu(br->lnum);
 		offs = le32_to_cpu(br->offs);
 		len = le32_to_cpu(br->len);
-		if (idx->level == 0) {
-			struct ubifs_ch *ch = (struct ubifs_ch*)node_buf;			
-			read_src_data(ubifs_sfd, lnum,offs,node_buf, len);
+		if (level == 0) {
+			struct ubifs_ch *ch = (struct ubifs_ch*)node_buf;
+			read_src_data(lnum,offs,node_buf, len);
 			len = le32_to_cpu(ch->len);
 			add_node(br->key, NULL, node_buf, len);
 		}else {
@@ -1989,25 +2188,19 @@ int add_data_node(struct ubifs_idx_node* idx)
 			struct ubifs_idx_node *cidx;
 			idx_sz = ubifs_idx_node_sz(sinfo, sinfo->fanout);
 			cidx = xmalloc(idx_sz);
-			read_src_data(ubifs_sfd, lnum, offs, cidx, idx_sz);
+			read_src_data(lnum, offs, cidx, idx_sz);
 			add_data_node(cidx);
 			free(cidx);
 		}
 	}
+
+	return 0;
 }
  
-static int _write_data(void)
+static int b_write_data(void)
 {
 	size_t idx_sz;
 	struct ubifs_idx_node *idx;
-	struct ubifs_sb_node sup;
-
-	//read supper block, 
-	ubifs_sfd = open(input, O_RDONLY);
-	if (ubifs_sfd < 0) {
-		printf("open ubifs image file %s failed\n", input);
-		return -1;
-	}
 
 	sinfo->key_len = UBIFS_SK_LEN;
 #ifdef WITHOUT_LZO
@@ -2016,16 +2209,65 @@ static int _write_data(void)
 	sinfo->default_compr = UBIFS_COMPR_LZO;
 #endif
 
-	read_src_supper(ubifs_sfd);
-	read_src_master(ubifs_sfd);
+	//read supper block, 
+	read_src_supper();
+	read_src_master();
 
 	idx_sz = ubifs_idx_node_sz(sinfo, sinfo->fanout);
 	idx = xmalloc(idx_sz);
-	read_src_data(ubifs_sfd, sinfo->zroot.lnum, sinfo->zroot.offs, idx, idx_sz);
+	read_src_data(sinfo->zroot.lnum, sinfo->zroot.offs, idx, idx_sz);
 	add_data_node(idx);
 	free(idx);
 
+	return flush_nodes();
+}
 
+static int _write_data(void)
+{
+	int i=0;
+	size_t idx_sz;
+	struct ubifs_idx_node *idx;
+	struct idx_entry *idx_ptr;
+	struct ubifs_ch *ch = (struct ubifs_ch*)node_buf;
+	int len;
+
+	sinfo->key_len = UBIFS_SK_LEN;
+#ifdef WITHOUT_LZO
+	sinfo->default_compr = UBIFS_COMPR_ZLIB;
+#else
+	sinfo->default_compr = UBIFS_COMPR_LZO;
+#endif
+
+	//read supper block, 
+	read_src_supper();
+	read_src_master();
+
+	printf("source min io size:%d, leb size:%d\n", sinfo->min_io_size, sinfo->leb_size);
+
+	//read all index node to list
+	idx_sz = ubifs_idx_node_sz(sinfo, sinfo->fanout);
+	idx = xmalloc(idx_sz);
+	
+	printf("read root idx node: lnum: %d,offs:%d\n", sinfo->zroot.lnum, sinfo->zroot.offs);
+	
+	read_src_data(sinfo->zroot.lnum, sinfo->zroot.offs, idx, idx_sz);
+	add_sindex(idx);
+	free(idx);
+
+	printf("====================write node=====================\n");
+
+	idx_ptr = sidx_list_first;
+	while(idx_ptr != NULL) {		
+		read_src_data(idx_ptr->lnum, idx_ptr->offs, node_buf, idx_ptr->len);
+		len = le32_to_cpu(ch->len);
+		add_node(&idx_ptr->key, NULL, node_buf, len);
+		idx_ptr = idx_ptr->next;
+		
+		//printf("add node: %d, add node %d, offs:%d, len:%d\n",sidx_cnt, i++, idx_ptr->offs, idx_ptr->len);
+	};
+
+	//free source idx
+	
 	return flush_nodes();
 }
 
@@ -2632,7 +2874,7 @@ static int mkfs(void)
 	if (!input) {
 		err = write_data();
 	}else {
-		err = _write_data();
+		err = b_write_data();
 	}
 	if (err)
 		goto out;
@@ -2677,6 +2919,10 @@ int main(int argc, char *argv[])
 	int err;
 
 	err = get_options(argc, argv);
+	if (err)
+		return err;
+
+	err = open_source();
 	if (err)
 		return err;
 
