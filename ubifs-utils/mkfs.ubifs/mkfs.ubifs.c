@@ -2026,7 +2026,7 @@ static int read_src_supper(void)
 {
 	struct ubifs_sb_node sup;
 	int err;
-	
+
 	err = read_file(0, &sup, sizeof(sup));
 	if (err == -1){
 		perror("read supper");
@@ -2165,6 +2165,24 @@ int add_sindex(struct ubifs_idx_node* idx)
 	return 0;
 }
 
+static int copy_node(union ubifs_key *key, char *name, void *node, int len)
+{
+	int err, lnum, offs;
+
+	//prepare_node(node, len);
+
+	err = reserve_space(len, &lnum, &offs);
+	if (err)
+		return err;
+
+	memcpy(leb_buf + offs, node, len);
+	memset(leb_buf + offs + len, 0xff, ALIGN(len, 8) - len);
+
+	add_to_index(key, name, lnum, offs, len);
+
+	return 0;
+}
+
 int add_data_node(struct ubifs_idx_node* idx)
 {
 	int i;
@@ -2182,7 +2200,7 @@ int add_data_node(struct ubifs_idx_node* idx)
 			struct ubifs_ch *ch = (struct ubifs_ch*)node_buf;
 			read_src_data(lnum,offs,node_buf, len);
 			len = le32_to_cpu(ch->len);
-			add_node(br->key, NULL, node_buf, len);
+			copy_node(br->key, NULL, node_buf, len);
 		}else {
 			int idx_sz;
 			struct ubifs_idx_node *cidx;
@@ -2222,12 +2240,30 @@ static int b_write_data(void)
 	return flush_nodes();
 }
 
+static int cmp_offset(const void *a, const void *b)
+{
+	const struct idx_entry *e1 = *(const struct idx_entry **)a;
+	const struct idx_entry *e2 = *(const struct idx_entry **)b;
+	int cmp;
+
+	if (e1->lnum < e2->lnum)
+		return -1;
+	else if (e1->lnum > e2->lnum)
+		return 1;
+
+	if (e1->offs < e2->offs)
+		return -1;
+	else if (e1->offs > e2->offs)
+		return 1;
+
+	return 0;
+}
+
 static int _write_data(void)
 {
-	int i=0;
-	size_t idx_sz;
+	size_t sz, i, cnt, idx_sz;
+	struct idx_entry **idx_ptr;
 	struct ubifs_idx_node *idx;
-	struct idx_entry *idx_ptr;
 	struct ubifs_ch *ch = (struct ubifs_ch*)node_buf;
 	int len;
 
@@ -2242,6 +2278,8 @@ static int _write_data(void)
 	read_src_supper();
 	read_src_master();
 
+	c->highest_inum = sinfo->highest_inum;
+
 	printf("source min io size:%d, leb size:%d\n", sinfo->min_io_size, sinfo->leb_size);
 
 	//read all index node to list
@@ -2251,22 +2289,32 @@ static int _write_data(void)
 	printf("read root idx node: lnum: %d,offs:%d\n", sinfo->zroot.lnum, sinfo->zroot.offs);
 	
 	read_src_data(sinfo->zroot.lnum, sinfo->zroot.offs, idx, idx_sz);
+	
 	add_sindex(idx);
 	free(idx);
 
+	/* Make an array of pointers to sort the index list */
+	sz = sidx_cnt * sizeof(struct idx_entry *);
+	if (sz / sizeof(struct idx_entry *) != sidx_cnt) {
+		free(idx);
+		return err_msg("index is too big (%zu entries)", sidx_cnt);
+	}
+	idx_ptr = xmalloc(sz);
+	idx_ptr[0] = sidx_list_first;
+	for (i = 1; i < sidx_cnt; i++)
+		idx_ptr[i] = idx_ptr[i - 1]->next;
+	qsort(idx_ptr, sidx_cnt, sizeof(struct idx_entry *), cmp_offset);
+
 	printf("====================write node=====================\n");
 
-	idx_ptr = sidx_list_first;
-	while(idx_ptr != NULL) {		
-		read_src_data(idx_ptr->lnum, idx_ptr->offs, node_buf, idx_ptr->len);
+	for (i = 0; i < sidx_cnt; i++) {
+		read_src_data(idx_ptr[i]->lnum, idx_ptr[i]->offs, node_buf, idx_ptr[i]->len);
 		len = le32_to_cpu(ch->len);
-		add_node(&idx_ptr->key, NULL, node_buf, len);
-		idx_ptr = idx_ptr->next;
+		copy_node(&idx_ptr[i]->key, NULL, node_buf, len); //sequence number can not be changed.
+		c->max_sqnum = ch->sqnum; //recovery sqnum
 		
 		//printf("add node: %d, add node %d, offs:%d, len:%d\n",sidx_cnt, i++, idx_ptr->offs, idx_ptr->len);
 	};
-
-	//free source idx
 	
 	return flush_nodes();
 }
@@ -2874,7 +2922,7 @@ static int mkfs(void)
 	if (!input) {
 		err = write_data();
 	}else {
-		err = b_write_data();
+		err = _write_data();
 	}
 	if (err)
 		goto out;
