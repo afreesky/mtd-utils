@@ -41,7 +41,7 @@
 #define DEFAULT_TIME_GRAN 1000000000
 
 #define SIZE_1M  0x100000
-#define DATA_CACHE_4M 0x1000000
+#define DATA_CACHE_4M 0x400000
 
 /**
  * struct idx_entry - index entry.
@@ -2308,9 +2308,12 @@ static int _write_data(void)
 	printf("====================write node=====================\n");
 
 	for (i = 0; i < sidx_cnt; i++) {
+		union ubifs_key  key;
+		key.u32[0] = le32_to_cpu(idx_ptr[i]->key.u32[0]);
+		key.u32[1] = le32_to_cpu(idx_ptr[i]->key.u32[1]);
 		read_src_data(idx_ptr[i]->lnum, idx_ptr[i]->offs, node_buf, idx_ptr[i]->len);
 		len = le32_to_cpu(ch->len);
-		copy_node(&idx_ptr[i]->key, NULL, node_buf, len); //sequence number can not be changed.
+		copy_node(&key, NULL, node_buf, len); //sequence number can not be changed.
 		c->max_sqnum = le64_to_cpu(ch->sqnum); //recovery sqnum
 		
 		//printf("add node: %d, add node %d, offs:%d, len:%d\n",sidx_cnt, i++, idx_ptr->offs, idx_ptr->len);
