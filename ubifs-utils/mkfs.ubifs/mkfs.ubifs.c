@@ -188,7 +188,7 @@ static const struct option longopts[] = {
 	{"squash-uids" ,       0, NULL, 'U'},
 	{"set-inode-attr",     0, NULL, 'a'},
 	{"src-ubifs-image",    1, NULL, 's'},
-	{"gzip-src-image",     1, NULL, 'z'},
+	{"gzip-src-image",     0, NULL, 'z'},
 	{NULL, 0, NULL, 0}
 };
 
@@ -204,6 +204,8 @@ static const char *helptext =
 "\tmkfs.ubifs /dev/ubi0_0\n\n"
 "Options:\n"
 "-r, -d, --root=DIR       build file system from directory DIR\n"
+"-s, --src-ubifs-image=   build file system from the given ubifs image\n"
+"-z, --gzip-src-image     source ubifs image is a gzip file\n"
 "-m, --min-io-size=SIZE   minimum I/O unit size\n"
 "-e, --leb-size=SIZE      logical erase block size\n"
 "-c, --max-leb-cnt=COUNT  maximum logical erase block count\n"
@@ -1864,6 +1866,11 @@ static int write_data(void)
 		root_st.st_mtime = time(NULL);
 		root_st.st_atime = root_st.st_ctime = root_st.st_mtime;
 		root_st.st_mode = mode;
+	}
+
+	if (squash_owner) {
+		root_st.st_mode = mode;
+		root_st.st_uid = root_st.st_gid = 0;
 	}
 
 	head_flags = 0;
